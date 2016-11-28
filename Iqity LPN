@@ -67,38 +67,54 @@ function preSubmit(type) {
         
         /* assign the work order */
         nlapiLogExecution('DEBUG', 'preSubmit', 'wo.id: ' + wo.id);
+		// TW Change: Add if statement to allow manual LPN Creation with no Work Order
+		if (woNumber !== 'Mixed') {
         if ( wo.id === null || wo.id === '' ) {
           throw new Error('Could not retrieve WO internal ID');
         } else {
           nlapiSetFieldValue('custrecordiqity_lpn_wo', wo.id);
         }
+		}
+		// TW Change: End
       }
     }
     
     /* check the WO status - must be Released or In Process */
     nlapiLogExecution('DEBUG', 'preSubmit', 'wo.status: ' + wo.status);
+	// TW Change: Add if statement to allow manual LPN Creation with no Work Order
+	if (woNumber !== 'Mixed') {
+		
     if ( wo.status != 'Released' && wo.status != 'In Process' ) {
       throw new Error('Cannot generate LPN for Work Order due to its ' + wo.status + ' status');
     }
-    
+	 
     /* check the assembly item - must match what was scanned */
     wo.loadAssemblyInfo();
     nlapiLogExecution('DEBUG', 'preSubmit', 'wo.assembly.name: ' + wo.assembly.name);
     var assy = new FieldValidator('custrecordiqity_lpn_assyname', 'Assembly', type);
     assy.forTypes(['create']).verifyValue(['any'], wo.assembly.name, false);
-
+	
+	}
+    // TW Change: End
+    
+	
   // EDIT
   } else if ( type == 'edit' || type == 'xedit' ) {
     /* confirm there is space in the bin for the transfer */
+	// TW Change:
+	var lpn_int_id = nlapiGetRecordId();
+	// TW Change end
     var to_bin = nlapiGetFieldValue('custrecordlpn_transferto');
     nlapiLogExecution('DEBUG', 'preSubmit', 'to_bin: ' + to_bin);
     if ( to_bin !== null && to_bin !== '' ) {
       /* retrieve the bin status from the custom field */
       var bin_record = nlapiLoadRecord('bin', to_bin);
       var max_lpn = bin_record.getFieldValue('custrecord_sb_max_no_lpn');
-      nlapiLogExecution('DEBUG', 'preSubmit', 'max_lpn: ' + max_lpn);
+      // TW Change: nlapiLogExecution('DEBUG', 'preSubmit', 'max_lpn: ' + max_lpn);
+      nlapiLogExecution('DEBUG', 'preSubmit', 'max_lpn: ' + max_lpn + ' LPNID: ' + lpn_int_id);
       var bin_avail = bin_record.getFieldValue('custrecord_sb_binavailable');
-      nlapiLogExecution('DEBUG', 'preSubmit', 'bin_avail: ' + bin_avail);
+      // TW Change: nlapiLogExecution('DEBUG', 'preSubmit', 'bin_avail: ' + bin_avail);
+      nlapiLogExecution('DEBUG', 'preSubmit', 'bin_avail: ' + bin_avail + ' LPNID: ' + lpn_int_id);
       if ( (max_lpn !== null && max_lpn !== '' && max_lpn > 0 ) && bin_avail == 0 ) {
         throw new Error('Bin is full');
       }
@@ -273,7 +289,8 @@ function postSubmit(type) {
         if ( lpnToBin !== null ) {
           /* perform the bin transfer if a new bin was identified */
           nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Performing bin transfer');
-          nlapiLogExecution('DEBUG', 'postSubmit-edit', 'binnumber:' + lpnBin + ' tobinnumber:' + lpnToBin);
+          // TW Change: nlapiLogExecution('DEBUG', 'postSubmit-edit', 'binnumber:' + lpnBin + ' tobinnumber:' + lpnToBin);
+          nlapiLogExecution('DEBUG', 'postSubmit-edit', 'binnumber:' + lpnBin + ' tobinnumber:' + lpnToBin + ' LPNID: ' + lpnId);
           
           var lpnBin = lpnRecord.getFieldValue('custrecordiqity_lpn_bin');
           
@@ -305,12 +322,14 @@ function postSubmit(type) {
             var same_loc = true;
             if ( from_bin.location.id == to_bin.location.id ) {
                 // SAME LOCATION
-                nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Attempting BIN transfer');
+                // TW Change: nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Attempting BIN transfer');
+                nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Attempting BIN transfer. LPNID: ' + lpnId);
                 var transfer_id = item.transfer(from_bin.location, lpnQty1, from_bin, to_bin, lpnLot1);
                 manageBinCount(transfer_id, null);
             } else {
                 // DIFFERENT LOCATION
-                nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Attempting LOCATION transfer');
+                // TW Change: nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Attempting LOCATION transfer');
+                nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Attempting LOCATION transfer. LPNID: ' +lpnId);
                 same_loc = false;
                 var transfer_id = item.locationTransfer(from_bin.location, lpnQty1, from_bin, to_bin, to_bin.location, lpnLot1);
                 manageBinCount(null, transfer_id);
