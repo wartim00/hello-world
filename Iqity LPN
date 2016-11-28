@@ -1,0 +1,494 @@
+/**
+ * IQity License Plate
+ *  This script:
+ *    - completes the IQity License Plate record when created from a scanner transaction,
+ *    - creates the associated Production Results record on initial creation
+ *    - performs bin transfer of LPN when updated with non-null "Transfer To Bin"
+ * 
+ * Version    Date             Author           Remarks
+ * 1.0        8 August 2014    Roundy           Initial script development
+ * 2.0        23 December 2015 Roundy           New LPN Validation and Repack features
+ *
+ * Dependencies
+ *  Lib_WorkOrder
+ *  Lib_WorkCenter
+ *  Lib_Item
+ *  Lib_Bin
+ *  Lib_FieldValidator
+ */
+
+function preSubmit(type) {
+  var currentContext = nlapiGetContext();
+  var executionContext = currentContext.getExecutionContext();
+
+  /* log event in debug mode */
+  nlapiLogExecution('DEBUG', 'Type ', type);
+  nlapiLogExecution('DEBUG', 'Execution Context', executionContext);
+
+  // check for existing LPN with same number
+  var number = new FieldValidator('name', 'LPN Number', type);
+  number.forTypes(['create','edit']).precludeDuplicate([], 'customrecordiqity_lpn');
+  
+  // check lot number format
+  var lot = new FieldValidator('custrecordiqity_lpn_lot', 'Lot Number', type);
+  lot.forTypes(['create','edit']).verifyFormat(['any'], 5, 5, /[0-9][A,B,C,D](0[0-9][0-9]|[1-2][0-9][0-9]|3[0-5][0-9]|36[0-6])/, 'Lot format invalid');
+
+  // CREATE
+  if ( type == 'create' ) {
+    /* create the required work order reference when only a work order number was provided */	
+    /* get work order fields */
+    var wo = null;
+    var woNumber = nlapiGetFieldValue('custrecordiqity_lpn_wonumber');
+    var woId = nlapiGetFieldValue('custrecordiqity_lpn_wo');
+    nlapiLogExecution('DEBUG', 'preSubmit', 'woNumber: ' + woNumber);
+    nlapiLogExecution('DEBUG', 'preSubmit', 'woId: ' + woId);
+    
+    /* establish the work order reference */
+    if ( woNumber === null || woNumber === '' ) {
+      nlapiLogExecution('AUDIT', 'preSubmit', 'No WO number provided - manual LPN assumed');
+      // get the work order object for later checks
+      if ( woId === null || woId === '' ) {
+        throw new Error('You must provide either a work order reference or a work order number');
+      } else {
+        wo = new WorkOrder();
+        wo.setId(woId);
+      }
+    } else {
+      /* check if a work order is already referenced */
+      if ( woId !== null && woId !== '' ) {
+        nlapiLogExecution('AUDIT', 'preSubmit', 'WO reference already populated (discarding number provided)');
+        nlapiSetFieldValue('custrecordiqity_lpn_wonumber', '');
+        wo = new WorkOrder();
+        wo.setId(woId);
+      } else {
+        /* get the work order by number */
+        wo = new WorkOrder();
+        wo.setNumber(woNumber);
+        
+        /* assign the work order */
+        nlapiLogExecution('DEBUG', 'preSubmit', 'wo.id: ' + wo.id);
+		// TW Change: Add if statement to allow manual LPN Creation with no Work Order
+		if (woNumber !== 'Mixed') {
+        if ( wo.id === null || wo.id === '' ) {
+          throw new Error('Could not retrieve WO internal ID');
+        } else {
+          nlapiSetFieldValue('custrecordiqity_lpn_wo', wo.id);
+        }
+		}
+		// TW Change: End
+      }
+    }
+    
+    /* check the WO status - must be Released or In Process */
+    nlapiLogExecution('DEBUG', 'preSubmit', 'wo.status: ' + wo.status);
+	// TW Change: Add if statement to allow manual LPN Creation with no Work Order
+	if (woNumber !== 'Mixed') {
+		
+    if ( wo.status != 'Released' && wo.status != 'In Process' ) {
+      throw new Error('Cannot generate LPN for Work Order due to its ' + wo.status + ' status');
+    }
+	 
+    /* check the assembly item - must match what was scanned */
+    wo.loadAssemblyInfo();
+    nlapiLogExecution('DEBUG', 'preSubmit', 'wo.assembly.name: ' + wo.assembly.name);
+    var assy = new FieldValidator('custrecordiqity_lpn_assyname', 'Assembly', type);
+    assy.forTypes(['create']).verifyValue(['any'], wo.assembly.name, false);
+	
+	}
+    // TW Change: End
+    
+	
+  // EDIT
+  } else if ( type == 'edit' || type == 'xedit' ) {
+    /* confirm there is space in the bin for the transfer */
+	// TW Change:
+	var lpn_int_id = nlapiGetRecordId();
+	// TW Change end
+    var to_bin = nlapiGetFieldValue('custrecordlpn_transferto');
+    nlapiLogExecution('DEBUG', 'preSubmit', 'to_bin: ' + to_bin);
+    if ( to_bin !== null && to_bin !== '' ) {
+      /* retrieve the bin status from the custom field */
+      var bin_record = nlapiLoadRecord('bin', to_bin);
+      var max_lpn = bin_record.getFieldValue('custrecord_sb_max_no_lpn');
+      // TW Change: nlapiLogExecution('DEBUG', 'preSubmit', 'max_lpn: ' + max_lpn);
+      nlapiLogExecution('DEBUG', 'preSubmit', 'max_lpn: ' + max_lpn + ' LPNID: ' + lpn_int_id);
+      var bin_avail = bin_record.getFieldValue('custrecord_sb_binavailable');
+      // TW Change: nlapiLogExecution('DEBUG', 'preSubmit', 'bin_avail: ' + bin_avail);
+      nlapiLogExecution('DEBUG', 'preSubmit', 'bin_avail: ' + bin_avail + ' LPNID: ' + lpn_int_id);
+      if ( (max_lpn !== null && max_lpn !== '' && max_lpn > 0 ) && bin_avail == 0 ) {
+        throw new Error('Bin is full');
+      }
+    }
+    
+    /* check for repack */
+    var repack_lpn = new FieldValidator('custrecordiqity_lpn_repack_lpn', 'Repack LPN', type);
+    nlapiLogExecution('DEBUG', 'preSubmit', 'repack_lpn: ' + repack_lpn.value.new);
+    
+    if ( repack_lpn.value.new !== '' ) {
+      /* make sure repack is not this LPN */
+      var id = nlapiGetRecordId();
+      nlapiLogExecution('DEBUG', 'preSubmit', 'id: ' + id);
+      if ( repack_lpn.value.new == id ) {
+        throw new Error('Repack LPN cannot be the current LPN record');
+      }
+
+      var repack_lot = new FieldValidator('custrecordiqity_lpn_repack_lot', 'Repack Lot', type);
+      nlapiLogExecution('DEBUG', 'preSubmit', 'repack_lot: ' + repack_lot.value.new);
+      repack_lot.forTypes(['edit']).precludeNull([]);
+      
+      var repack_cnt = new FieldValidator('custrecordiqity_lpn_repack_casecnt', 'Repack Count', type);
+      nlapiLogExecution('DEBUG', 'preSubmit', 'repack_cnt: ' + repack_cnt.value.new);
+      repack_cnt.forTypes(['edit']).precludeNull([]);
+      
+      // confirm the lot to repack is on the LPN
+      var found_lot = '';
+      var field_no = '';
+      for ( var i=1; i<=4; i++ ) {
+        field_no = ( i == 1 ? '' : String(i));
+        var check_lot = nlapiGetFieldValue('custrecordiqity_lpn_lot'+field_no);
+        if ( check_lot == repack_lot.value.new ) {
+          found_lot = repack_lot;
+          break;
+        }
+      }
+      
+      if ( found_lot === '' ) {
+        throw new Error('Lot identified for repack (' + repack_lot.value.new + ') not found on LPN');
+      }
+      
+      // confirm the amount to repack is available
+      var check_cnt_str = nlapiGetFieldValue('custrecordiqity_lpn_casecnt'+field_no);
+      var check_cnt = parseFloat(check_cnt_str);
+      var repack_cnt_num = parseFloat(repack_cnt.value.new);
+      if ( check_cnt < repack_cnt_num ) {
+        throw new Error('Insufficient number of cases (' + check_cnt + ') on LPN for repack');
+      }
+      
+      // confirm the target LPN is for the same item
+      var lpnType = nlapiGetRecordType();
+      var lpnRepack = nlapiLoadRecord(lpnType, repack_lpn.value.new);
+      var repackAssembly = lpnRepack.getFieldValue('custrecordiqity_lpn_assy');
+      var assembly = new FieldValidator('custrecordiqity_lpn_assy', 'Assembly Item', type);
+      if ( repackAssembly != assembly.value.new ) {
+        throw new Error('Repack LPN holds a different item');
+      }
+      
+      // confirm the LPNs are in the same bin
+      var repackBin = lpnRepack.getFieldValue('custrecordiqity_lpn_bin');
+      var bin = new FieldValidator('custrecordiqity_lpn_bin', 'Bin', type);
+      if ( repackBin != bin.value.new ) {
+        throw new Error('Repack LPN is not in the same bin');
+      }
+      
+    }
+    
+  }
+}
+
+function postSubmit(type) {
+    var currentContext = nlapiGetContext();  
+    var executionContext = currentContext.getExecutionContext();
+    /* log event in debug mode */
+    nlapiLogExecution('DEBUG', 'Execution Context', executionContext);
+    nlapiLogExecution('DEBUG', 'Current Context', currentContext);
+
+    if ( type == 'create' ) {
+        /* post the Production Results record for the LPN */
+        /* get work order fields */
+        var lpnId = nlapiGetRecordId();
+        var lpnType = nlapiGetRecordType();
+        var lpnRecord = nlapiLoadRecord(lpnType, lpnId);
+        var lpnWO = lpnRecord.getFieldValue('custrecordiqity_lpn_wo');
+        if ( lpnWO === null || lpnWO === '' ) {
+            nlapiLogExecution('DEBUG', 'postSubmit-create', 'No work order - skipping Production Results creation');
+            return true;
+        } else {
+            var lpnCaseCnt = lpnRecord.getFieldValue('custrecordiqity_lpn_casecnt');
+            var lpnLot = lpnRecord.getFieldValue('custrecordiqity_lpn_lot');
+            nlapiLogExecution('DEBUG', 'postSubmit-create', 'lpnId: ' + lpnId);
+            nlapiLogExecution('DEBUG', 'postSubmit-create', 'lpnWO: ' + lpnWO);
+            nlapiLogExecution('DEBUG', 'postSubmit-create', 'lpnLot: ' + lpnLot);
+            nlapiLogExecution('DEBUG', 'postSubmit-create', 'lpnCaseCnt: ' + lpnCaseCnt);
+            
+            /* get the necessary work order information */
+            var wo = new WorkOrder();
+            wo.setId(lpnWO).loadMfgOperations();
+            var lastOper = wo.getLastOperation();
+            
+            /* establish the result date stamps */
+            var now = new Date();
+            var nowStr = nlapiDateToString(now, 'datetimetz');
+            var oneHrAgo = nlapiStringToDate(nowStr, 'datetimetz');
+            oneHrAgo.setHours(now.getHours() - 1);
+            var startDate = nlapiDateToString(oneHrAgo, 'datetimetz');
+            var endDate = nlapiDateToString(now, 'datetimetz');
+            nlapiLogExecution('DEBUG', 'postSubmit-create', 'startDate: ' + startDate);
+            nlapiLogExecution('DEBUG', 'postSubmit-create', 'endDate: ' + endDate);
+            nlapiLogExecution('DEBUG', 'postSubmit-create', 'lastOper.seq:' + lastOper.seq);
+            
+            /* update the license plate record: bin should match completion logic */
+            var lastWorkCenter = new WorkCenter(lastOper.workcenter);
+            lastWorkCenter.loadBins();
+            nlapiLogExecution('DEBUG', 'postSubmit-create', 'completionBin: ' + lastWorkCenter.bin.complete);
+            lpnRecord = nlapiLoadRecord(lpnType, lpnId); // reload to avoid stale record
+            lpnRecord.setFieldValue('custrecordiqity_lpn_bin', lastWorkCenter.bin.complete);
+            lpnRecord.setFieldValue('custrecordiqity_lpn_posted', 'T');
+            var lpnRecordId = nlapiSubmitRecord(lpnRecord);
+
+            /* generate the Production Results record for this License Plate - suitelet approach
+            try {
+                nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Calling suitelet to build Production Result');
+                var param ={};
+                param['custscriptworkordernumber'] = wo.number;
+                param['custscriptoperationnumber'] =  lastOper.seq;
+                param['custscriptlpnlot'] = lpnLot;
+                param['custscriptlpncasecount'] = lpnCaseCnt;
+                param['custscriptstartdate'] = startDate;
+                param['custscriptenddate'] = endDate;
+                var url = nlapiResolveURL('SUITELET', 'customscriptiqity_pr_from_lpn', 'customdeployiqity_pr_from_lpn', true);
+                nlapiLogExecution('DEBUG', 'postSubmit-edit', 'url: ' + url);
+                var response = nlapiRequestURL(url, param);
+                //var respError = response.getError();
+                //nlapiLogExecution('DEBUG', 'postSubmit-edit', respError.getDetails());
+            } catch(e) {
+                nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Error generating Production Results');
+                throw e;
+            } */
+            
+            /* generate the Production Results record for this License Plate - scheduled script approach */
+            nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Calling scheduled script to build Production Result');
+            try {
+                var param ={};
+                param['custscriptlpnid'] = lpnRecordId;
+                param['custscriptworkordernumber'] = wo.number;
+                param['custscriptoperationnumber'] =  lastOper.seq;
+                param['custscriptlpnlot'] = lpnLot;
+                param['custscriptlpncasecount'] = lpnCaseCnt;
+                param['custscriptstartdate'] = startDate;
+                param['custscriptenddate'] = endDate;
+                var scriptStatus = nlapiScheduleScript('customscriptiqity_create_pr_for_lpn', null, param);
+                nlapiLogExecution('DEBUG', 'postSubmit-edit', 'scriptStatus: ' + scriptStatus);
+            } catch(e) {
+                nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Error generating Production Results');
+                throw e;
+            }
+            
+            return true;
+        }
+        
+	} else if ( type == 'edit' ) {
+        
+        /* get work order fields */
+        var lpnId = nlapiGetRecordId();
+        var lpnType = nlapiGetRecordType();
+        var lpnRecord = nlapiLoadRecord(lpnType, lpnId);
+        var lpnToBin = lpnRecord.getFieldValue('custrecordlpn_transferto');
+        var lpnRepackTo = lpnRecord.getFieldValue('custrecordiqity_lpn_repack_lpn');
+        
+        // check for bin transfer
+        if ( lpnToBin !== null ) {
+          /* perform the bin transfer if a new bin was identified */
+          nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Performing bin transfer');
+          // TW Change: nlapiLogExecution('DEBUG', 'postSubmit-edit', 'binnumber:' + lpnBin + ' tobinnumber:' + lpnToBin);
+          nlapiLogExecution('DEBUG', 'postSubmit-edit', 'binnumber:' + lpnBin + ' tobinnumber:' + lpnToBin + ' LPNID: ' + lpnId);
+          
+          var lpnBin = lpnRecord.getFieldValue('custrecordiqity_lpn_bin');
+          
+            /* get the item information to perform the transfer */
+            var lpnAssy = lpnRecord.getFieldValue('custrecordiqity_lpn_assy');
+            /* lot 1 */
+            var lpnLot1 = lpnRecord.getFieldValue('custrecordiqity_lpn_lot');
+            var lpnQty1 = lpnRecord.getFieldValue('custrecordiqity_lpn_casecnt');
+            nlapiLogExecution('DEBUG', 'postSubmit-edit', 'assy:' + lpnAssy + ' lot1:' + lpnLot1 + ' qty1:' + lpnQty1);
+            /* lot 2 */
+            var lpnLot2 = lpnRecord.getFieldValue('custrecordiqity_lpn_lot2');
+            var lpnQty2 = lpnRecord.getFieldValue('custrecordiqity_lpn_casecnt2');
+            nlapiLogExecution('DEBUG', 'postSubmit-edit', 'assy:' + lpnAssy + ' lot2:' + lpnLot2 + ' qty2:' + lpnQty2);
+            /* lot 3 */
+            var lpnLot3 = lpnRecord.getFieldValue('custrecordiqity_lpn_lot3');
+            var lpnQty3 = lpnRecord.getFieldValue('custrecordiqity_lpn_casecnt3');
+            nlapiLogExecution('DEBUG', 'postSubmit-edit', 'assy:' + lpnAssy + ' lot3:' + lpnLot3 + ' qty3:' + lpnQty3);
+            /* lot 4 */
+            var lpnLot4 = lpnRecord.getFieldValue('custrecordiqity_lpn_lot4');
+            var lpnQty4 = lpnRecord.getFieldValue('custrecordiqity_lpn_casecnt4');
+            nlapiLogExecution('DEBUG', 'postSubmit-edit', 'assy:' + lpnAssy + ' lot4:' + lpnLot4 + ' qty4:' + lpnQty4);
+            
+            /* get helper objects to help with the transfer */
+            var item = new Item().setId(lpnAssy);
+            var from_bin = new Bin().setId(lpnBin);
+            var to_bin = new Bin().setId(lpnToBin);
+            
+            /* determine if bins are in the same location */
+            var same_loc = true;
+            if ( from_bin.location.id == to_bin.location.id ) {
+                // SAME LOCATION
+                // TW Change: nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Attempting BIN transfer');
+                nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Attempting BIN transfer. LPNID: ' + lpnId);
+                var transfer_id = item.transfer(from_bin.location, lpnQty1, from_bin, to_bin, lpnLot1);
+                manageBinCount(transfer_id, null);
+            } else {
+                // DIFFERENT LOCATION
+                // TW Change: nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Attempting LOCATION transfer');
+                nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Attempting LOCATION transfer. LPNID: ' +lpnId);
+                same_loc = false;
+                var transfer_id = item.locationTransfer(from_bin.location, lpnQty1, from_bin, to_bin, to_bin.location, lpnLot1);
+                manageBinCount(null, transfer_id);
+            }
+            
+            // clear the bin if the transfer was successful
+            if ( transfer_id !== null ) {
+                lpnRecord = nlapiLoadRecord(lpnType, lpnId); // reload to avoid stale record
+                lpnRecord.setFieldValue('custrecordiqity_lpn_bin', lpnToBin);
+                lpnRecord.setFieldValue('custrecordlpn_transferto', '');
+                var lpnRecordId = nlapiSubmitRecord(lpnRecord);
+                
+                // handle additional lots if present
+                if ( lpnLot2 !== null && lpnLot2 !== '' ) {
+                    if ( same_loc ) {
+                        transfer_id = item.transfer(from_bin.location, lpnQty2, from_bin, to_bin, lpnLot2);
+                    } else {
+                        transfer_id = item.locationTransfer(from_bin.location, lpnQty2, from_bin, to_bin, to_bin.location, lpnLot2);
+                    }
+                }
+                if ( lpnLot3 !== null && lpnLot3 !== '' ) {
+                    if ( same_loc ) {
+                        transfer_id = item.transfer(from_bin.location, lpnQty3, from_bin, to_bin, lpnLot3);
+                    } else {
+                        transfer_id = item.locationTransfer(from_bin.location, lpnQty3, from_bin, to_bin, to_bin.location, lpnLot3);
+                    }
+                }
+                if ( lpnLot4 !== null && lpnLot4 !== '' ) {
+                    if ( same_loc ) {
+                        transfer_id = item.transfer(from_bin.location, lpnQty4, from_bin, to_bin, lpnLot4);
+                    } else {
+                        transfer_id = item.locationTransfer(from_bin.location, lpnQty3, from_bin, to_bin, to_bin.location, lpnLot3);
+                    }
+                }
+                
+            }
+            
+            return true;
+            
+        // check for repack
+        } else if ( lpnRepackTo !== null ) {
+          // perform LPN repack
+          nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Performing repack');
+          
+          // increment the target LPN's lot by the count
+          var repack_lpn = lpnRecord.getFieldValue('custrecordiqity_lpn_repack_lpn');
+          var repack_lot = lpnRecord.getFieldValue('custrecordiqity_lpn_repack_lot');
+          var repack_cnt = parseFloat(lpnRecord.getFieldValue('custrecordiqity_lpn_repack_casecnt'));
+          var to_lot = getLotInfo(repack_lpn, repack_lot);
+          if ( to_lot.fieldNo == 'FULL' ) {
+            throw new Error("No room on LPN to transfer a new lot");
+          } else {
+            // adding lot to the target LPN
+            to_record = nlapiLoadRecord(lpnType, repack_lpn);
+            to_record.setFieldValue('custrecordiqity_lpn_lot'+to_lot.fieldNo, repack_lot); // set this in case we got a blank spot
+            to_record.setFieldValue('custrecordiqity_lpn_casecnt'+to_lot.fieldNo, to_lot.quantity+repack_cnt);
+            var to_record_id = nlapiSubmitRecord(to_record);
+          }
+          
+          // decrement the current LPN's lot by the count
+          var from_lot = getLotInfo(lpnId, repack_lot);
+          if ( from_lot.quantity > 0 ) {
+            lpnRecord.setFieldValue('custrecordiqity_lpn_casecnt'+from_lot.fieldNo, from_lot.quantity-repack_cnt);
+            
+            // also set the repack fields to empty
+            lpnRecord.setFieldValue('custrecordiqity_lpn_repack_lpn', '');
+            lpnRecord.setFieldValue('custrecordiqity_lpn_repack_lot', '');
+            lpnRecord.setFieldValue('custrecordiqity_lpn_repack_casecnt', '');
+            
+            // check to see if the LPN is now empty and if so deactivate it
+            var counts = ['custrecordiqity_lpn_casecnt','custrecordiqity_lpn_casecnt2','custrecordiqity_lpn_casecnt3','custrecordiqity_lpn_casecnt4'];
+            var total_cases = 0;
+            for ( var i in counts ) {
+              var cases = lpnRecord.getFieldValue(counts[i]);
+              if ( cases !== null && cases !== '' ) {
+                total_cases += parseInt(cases);
+                nlapiLogExecution('DEBUG','repack','#: ' + i + ' count: ' + total_cases);
+                if ( total_cases > 0 ) { break; }
+              }
+            }
+            if ( total_cases <= 0 ) {
+              lpnRecord.setFieldValue('isinactive','T');
+            }
+            // save the record
+            var lpnRecordId = nlapiSubmitRecord(lpnRecord);
+          }
+        }
+    }
+    
+    return false;
+}
+
+/* function to call the NetSuite script which manages the count of items in a bin */
+function manageBinCount(binTransferId, locTransferId) {
+    // call the NetSuite script to increment the bin quantity
+    try {
+        nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Calling NetSuite script to increment bin qty');
+        var param ={};
+        param['custparam_bintransferid'] = binTransferId;
+        param['custparam_loctransferid'] = locTransferId;
+        var url = nlapiResolveURL('SUITELET', 'customscript_update_bin_quantity', 'customdeploy_update_bin_quantity', true);
+        nlapiLogExecution('DEBUG', 'postSubmit-edit', 'url: ' + url);
+        var response = nlapiRequestURL(url, param);
+    } catch(e) {
+        nlapiLogExecution('DEBUG', 'postSubmit-edit', 'Could not find NetSuite script');
+    }
+
+}
+
+
+/* getLotInfo - search through an LPN record to find lot details
+ *  @param lpnRecordId {integer} - internal ID of the LPN record to search
+ *  @param lotNumber {string} - lot to match
+ *  @return lotInfo {object} - lot details
+ *
+ *  lotInfo {
+ *    lotNo:     equal to lotNumber if found; FULL if not found an no empty slots
+ *    fieldNo:   equal to the field suffix if found; first empty field if not found
+ *    quantity:  case count of lot if found; zero if not found
+ *  }
+ */
+function getLotInfo(lpnRecordId, lotNumber) {
+  var lotInfo = null;
+  
+  // load the record
+  var lpn_type = nlapiGetRecordType();
+  var lpn_record = nlapiLoadRecord(lpn_type, lpnRecordId);
+  
+  // loop through the 4 field with lot information
+  var field_no;
+  for ( var i=1; i<=4; i++ ) {
+    field_no = ( i == 1 ? '' : String(i));
+    nlapiLogExecution('DEBUG', 'getLotInfo', 'checking field_no: ' + field_no);
+    var check_lot = lpn_record.getFieldValue('custrecordiqity_lpn_lot'+field_no);
+    nlapiLogExecution('DEBUG', 'getLotInfo', 'check_lot: ' + check_lot);
+    if ( check_lot == lotNumber ) {
+      lotInfo = {
+        lotNo: lotNumber,
+        fieldNo: field_no,
+        quantity: parseFloat(lpn_record.getFieldValue('custrecordiqity_lpn_casecnt'+field_no))
+      };
+      break;
+    } else if ( check_lot === null || check_lot === '' ) {
+      lotInfo = {
+        lotNo: '',
+        fieldNo: field_no,
+        quantity: 0
+      };
+      break;
+    }
+  }
+  
+  // make sure we didn't run past the last slot on the LPN
+  if ( !lotInfo ) {
+    lotInfo = {
+      lotNo: 'FULL',
+      fieldNo: 'FULL',
+      quantity: 'FULL'
+    };
+  }
+  return lotInfo;
+}
